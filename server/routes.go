@@ -117,28 +117,29 @@ func modelOptions(model *Model, requestOpts map[string]any) (api.Options, error)
 }
 
 // scheduleRunner schedules a runner after validating inputs such as capabilities and model options.
-// It returns the allocated runner, model instance, and consolidated options if successful and error otherwise.
-func (s *Server) scheduleRunner(ctx context.Context, name string, caps []model.Capability, requestOpts map[string]any, keepAlive *api.Duration) (llm.LlamaServer, *Model, *api.Options, error) {
+// It returns the allocated runner, model instance, consolidated options, and request ID if successful and error otherwise.
+func (s *Server) scheduleRunner(ctx context.Context, name string, caps []model.Capability, requestOpts map[string]any,
+	keepAlive *api.Duration, requestID string) (llm.LlamaServer, *Model, *api.Options, string, error) {
 	if name == "" {
-		return nil, nil, nil, fmt.Errorf("model %w", errRequired)
+		return nil, nil, nil, "", fmt.Errorf("model %w", errRequired)
 	}
 
 	model, err := GetModel(name)
 	if err != nil {
-		return nil, nil, nil, err
+		return nil, nil, nil, "", err
 	}
 
 	if slices.Contains(model.Config.ModelFamilies, "mllama") && len(model.ProjectorPaths) > 0 {
-		return nil, nil, nil, fmt.Errorf("'llama3.2-vision' is no longer compatible with your version of Ollama and has been replaced by a newer version. To re-download, run 'ollama pull llama3.2-vision'")
+		return nil, nil, nil, "", fmt.Errorf("'llama3.2-vision' is no longer compatible with your version of Ollama and has been replaced by a newer version. To re-download, run 'ollama pull llama3.2-vision'")
 	}
 
 	if err := model.CheckCapabilities(caps...); err != nil {
-		return nil, nil, nil, fmt.Errorf("%s %w", name, err)
+		return nil, nil, nil, "", fmt.Errorf("%s %w", name, err)
 	}
 
 	opts, err := modelOptions(model, requestOpts)
 	if err != nil {
-		return nil, nil, nil, err
+		return nil, nil, nil, "", err
 	}
 
 	// This model is much more capable with a larger context, so set that
@@ -150,15 +151,15 @@ func (s *Server) scheduleRunner(ctx context.Context, name string, caps []model.C
 		opts.NumCtx = max(opts.NumCtx, 8192)
 	}
 
-	runnerCh, errCh := s.sched.GetRunner(ctx, model, opts, keepAlive)
+	runnerCh, errCh, requestID := s.sched.GetRunner(ctx, model, opts, keepAlive, requestID)
 	var runner *runnerRef
 	select {
 	case runner = <-runnerCh:
 	case err = <-errCh:
-		return nil, nil, nil, err
+		return nil, nil, nil, "", err
 	}
 
-	return runner.llama, model, &opts, nil
+	return runner.llama, model, &opts, requestID, nil
 }
 
 func signinURL() (string, error) {
@@ -368,7 +369,10 @@ func (s *Server) GenerateHandler(c *gin.Context) {
 		}
 	}
 
-	r, m, opts, err := s.scheduleRunner(c.Request.Context(), name.String(), caps, req.Options, req.KeepAlive)
+	requestID := req.ID
+
+	r, m, opts, requestID, err := s.scheduleRunner(c.Request.Context(), name.String(), caps, req.Options,
+		req.KeepAlive, requestID)
 	if errors.Is(err, errCapabilityCompletion) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": fmt.Sprintf("%q does not support generate", req.Model)})
 		return
@@ -521,6 +525,12 @@ func (s *Server) GenerateHandler(c *gin.Context) {
 			Logprobs:    req.Logprobs,
 			TopLogprobs: req.TopLogprobs,
 		}, func(cr llm.CompletionResponse) {
+			// Update token count
+			if cr.EvalCount > 0 {
+				// Treat EvalCount as a running total if provided
+				s.sched.UpdateRequestTokens(requestID, cr.EvalCount)
+			}
+
 			res := api.GenerateResponse{
 				Model:     req.Model,
 				CreatedAt: time.Now().UTC(),
@@ -533,6 +543,7 @@ func (s *Server) GenerateHandler(c *gin.Context) {
 					EvalDuration:       cr.EvalDuration,
 				},
 				Logprobs: toAPILogprobs(cr.Logprobs),
+				ID:       requestID,
 			}
 
 			if builtinParser != nil {
@@ -682,7 +693,8 @@ func (s *Server) EmbedHandler(c *gin.Context) {
 		return
 	}
 
-	r, m, opts, err := s.scheduleRunner(c.Request.Context(), name.String(), []model.Capability{}, req.Options, req.KeepAlive)
+	r, m, opts, _, err := s.scheduleRunner(c.Request.Context(), name.String(), []model.Capability{},
+		req.Options, req.KeepAlive, "")
 	if err != nil {
 		handleScheduleError(c, req.Model, err)
 		return
@@ -807,7 +819,8 @@ func (s *Server) EmbeddingsHandler(c *gin.Context) {
 		return
 	}
 
-	r, _, _, err := s.scheduleRunner(c.Request.Context(), name.String(), []model.Capability{}, req.Options, req.KeepAlive)
+	r, _, _, _, err := s.scheduleRunner(c.Request.Context(), name.String(), []model.Capability{}, req.Options,
+		req.KeepAlive, "")
 	if err != nil {
 		handleScheduleError(c, req.Model, err)
 		return
@@ -1512,6 +1525,7 @@ func (s *Server) GenerateRoutes(rc *ollama.Registry) (http.Handler, error) {
 
 	// Inference
 	r.GET("/api/ps", s.PsHandler)
+	r.GET("/api/status", s.StatusHandler)
 	r.POST("/api/generate", s.GenerateHandler)
 	r.POST("/api/chat", s.ChatHandler)
 	r.POST("/api/embed", s.EmbedHandler)
@@ -1788,6 +1802,27 @@ func (s *Server) SignoutHandler(c *gin.Context) {
 	c.JSON(http.StatusOK, nil)
 }
 
+func (s *Server) StatusHandler(c *gin.Context) {
+	status := s.sched.GetStatus()
+
+	// Convert to API types
+	runningReqs := make([]api.RequestStatus, len(status.RunningRequests))
+	for i, req := range status.RunningRequests {
+		runningReqs[i] = api.RequestStatus{
+			ID:              req.ID,
+			GeneratedTokens: req.GeneratedTokens,
+		}
+	}
+
+	resp := api.StatusResponse{
+		RunningRequests: runningReqs,
+		PendingRequests: status.PendingRequests,
+		FreeMemory:      status.FreeMemory,
+	}
+
+	c.JSON(http.StatusOK, resp)
+}
+
 func (s *Server) PsHandler(c *gin.Context) {
 	models := []api.ProcessModelResponse{}
 
@@ -2007,7 +2042,8 @@ func (s *Server) ChatHandler(c *gin.Context) {
 		}
 	}
 
-	r, m, opts, err := s.scheduleRunner(c.Request.Context(), name.String(), caps, req.Options, req.KeepAlive)
+	r, m, opts, requestID, err := s.scheduleRunner(c.Request.Context(), name.String(), caps, req.Options,
+		req.KeepAlive, "")
 	if errors.Is(err, errCapabilityCompletion) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": fmt.Sprintf("%q does not support chat", req.Model)})
 		return
@@ -2142,6 +2178,9 @@ func (s *Server) ChatHandler(c *gin.Context) {
 				Logprobs:    req.Logprobs,
 				TopLogprobs: req.TopLogprobs,
 			}, func(r llm.CompletionResponse) {
+				if r.EvalCount > 0 {
+					s.sched.UpdateRequestTokens(requestID, r.EvalCount)
+				}
 				res := api.ChatResponse{
 					Model:     req.Model,
 					CreatedAt: time.Now().UTC(),

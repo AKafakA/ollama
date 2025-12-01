@@ -719,8 +719,9 @@ func (s *Server) completion(w http.ResponseWriter, r *http.Request) {
 		case resp, ok := <-seq.responses:
 			if ok {
 				if err := json.NewEncoder(w).Encode(&llm.CompletionResponse{
-					Content:  resp.content,
-					Logprobs: resp.logprobs,
+					Content:   resp.content,
+					EvalCount: seq.numDecoded,
+					Logprobs:  resp.logprobs,
 				}); err != nil {
 					http.Error(w, fmt.Sprintf("failed to encode response: %v", err), http.StatusInternalServerError)
 					close(seq.quit)

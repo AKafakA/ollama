@@ -2,6 +2,8 @@ package server
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -31,6 +33,8 @@ type LlmRequest struct {
 	successCh       chan *runnerRef
 	errCh           chan error
 	schedAttempts   uint
+	id              string // unique request ID
+	generatedTokens int    // number of tokens generated so far
 }
 
 type Scheduler struct {
@@ -47,7 +51,13 @@ type Scheduler struct {
 	// one model at a time but new requests to models that already loaded can
 	// happen in parallel
 	activeLoading llm.LlamaServer
-	loaded        map[string]*runnerRef
+
+	// tracking pending and running requests
+	requestMu       sync.RWMutex
+	pendingRequests []string               // list of pending request IDs
+	runningRequests map[string]*LlmRequest // map of running request ID to request
+
+	loaded map[string]*runnerRef
 
 	loadFn          func(req *LlmRequest, f *ggml.GGML, systemInfo ml.SystemInfo, gpus []ml.DeviceInfo, requireFull bool) bool
 	newServerFn     func(systemInfo ml.SystemInfo, gpus []ml.DeviceInfo, model string, f *ggml.GGML, adapters []string, projectors []string, opts api.Options, numParallel int) (llm.LlamaServer, error)
@@ -63,6 +73,16 @@ var defaultModelsPerGPU = 3
 
 var ErrMaxQueue = errors.New("server busy, please try again.  maximum pending requests exceeded")
 
+// generateRequestID generates a unique request ID
+func generateRequestID() string {
+	b := make([]byte, 8)
+	_, err := rand.Read(b)
+	if err != nil {
+		return ""
+	}
+	return hex.EncodeToString(b)
+}
+
 func InitScheduler(ctx context.Context) *Scheduler {
 	maxQueue := envconfig.MaxQueue()
 	sched := &Scheduler{
@@ -71,6 +91,8 @@ func InitScheduler(ctx context.Context) *Scheduler {
 		expiredCh:       make(chan *runnerRef, maxQueue),
 		unloadedCh:      make(chan any, maxQueue),
 		loaded:          make(map[string]*runnerRef),
+		pendingRequests: make([]string, 0),
+		runningRequests: make(map[string]*LlmRequest),
 		newServerFn:     llm.NewLlamaServer,
 		getGpuFn:        discover.GPUDevices,
 		getSystemInfoFn: discover.GetSystemInfo,
@@ -81,7 +103,9 @@ func InitScheduler(ctx context.Context) *Scheduler {
 }
 
 // context must be canceled to decrement ref count and release the runner
-func (s *Scheduler) GetRunner(c context.Context, m *Model, opts api.Options, sessionDuration *api.Duration) (chan *runnerRef, chan error) {
+// Returns runner channel, error channel, and request ID
+func (s *Scheduler) GetRunner(c context.Context, m *Model, opts api.Options,
+	sessionDuration *api.Duration, requestId string) (chan *runnerRef, chan error, string) {
 	if opts.NumCtx < 4 {
 		opts.NumCtx = 4
 	}
@@ -91,6 +115,15 @@ func (s *Scheduler) GetRunner(c context.Context, m *Model, opts api.Options, ses
 		opts.NumCtx = max(opts.NumCtx, 2048)
 	}
 
+	if requestId != "" {
+		// If a request ID is provided, use it
+		slog.Debug("using provided request ID", "id", requestId)
+	} else {
+		// Generate a new request ID
+		requestId = generateRequestID()
+		slog.Debug("generated new request ID", "id", requestId)
+	}
+
 	req := &LlmRequest{
 		ctx:             c,
 		model:           m,
@@ -98,6 +131,7 @@ func (s *Scheduler) GetRunner(c context.Context, m *Model, opts api.Options, ses
 		sessionDuration: sessionDuration,
 		successCh:       make(chan *runnerRef, 1),
 		errCh:           make(chan error, 1),
+		id:              requestId,
 	}
 
 	s.loadedMu.Lock()
@@ -105,14 +139,22 @@ func (s *Scheduler) GetRunner(c context.Context, m *Model, opts api.Options, ses
 	s.loadedMu.Unlock()
 	if runner != nil && !runner.needsReload(c, req) {
 		req.useLoadedRunner(runner, s.finishedReqCh)
+		// Track as running immediately
+		s.requestMu.Lock()
+		s.runningRequests[req.id] = req
+		s.requestMu.Unlock()
 	} else {
 		select {
 		case s.pendingReqCh <- req:
+			// Track as pending
+			s.requestMu.Lock()
+			s.pendingRequests = append(s.pendingRequests, req.id)
+			s.requestMu.Unlock()
 		default:
 			req.errCh <- ErrMaxQueue
 		}
 	}
-	return req.successCh, req.errCh
+	return req.successCh, req.errCh, req.id
 }
 
 // Returns immediately, spawns go routines for the scheduler which will shutdown when ctx is done
@@ -139,6 +181,16 @@ func (s *Scheduler) processPending(ctx context.Context) {
 			// Block other requests until we get this pending request running
 			pending.schedAttempts++
 
+			// Remove from pending list
+			s.requestMu.Lock()
+			for i, id := range s.pendingRequests {
+				if id == pending.id {
+					s.pendingRequests = append(s.pendingRequests[:i], s.pendingRequests[i+1:]...)
+					break
+				}
+			}
+			s.requestMu.Unlock()
+
 			if pending.ctx.Err() != nil {
 				slog.Debug("pending request cancelled or timed out, skipping scheduling")
 				continue
@@ -164,6 +216,11 @@ func (s *Scheduler) processPending(ctx context.Context) {
 						// Runner is usable, return it
 						logutil.Trace("using existing loaded runner", "model", pending.model.ModelPath)
 						pending.useLoadedRunner(runner, s.finishedReqCh)
+						// Track as running
+
+						s.requestMu.Lock()
+						s.runningRequests[pending.id] = pending
+						s.requestMu.Unlock()
 						break
 					}
 				} else if maxRunners > 0 && loadedCount >= int(maxRunners) {
@@ -269,6 +326,11 @@ func (s *Scheduler) processCompleted(ctx context.Context) {
 			slog.Debug("shutting down scheduler completed loop")
 			return
 		case finished := <-s.finishedReqCh:
+			// Remove from running requests
+			s.requestMu.Lock()
+			delete(s.runningRequests, finished.id)
+			s.requestMu.Unlock()
+
 			s.loadedMu.Lock()
 			runner := s.loaded[finished.model.ModelPath]
 			s.loadedMu.Unlock()
@@ -537,6 +599,10 @@ iGPUScan:
 			slog.Debug("context for request finished")
 			s.finishedReqCh <- req
 		}()
+		// Track as running
+		s.requestMu.Lock()
+		s.runningRequests[req.id] = req
+		s.requestMu.Unlock()
 		req.successCh <- runner
 	}()
 
@@ -863,5 +929,58 @@ func (s *Scheduler) expireRunner(model *Model) {
 			s.expiredCh <- runner
 		}
 		runner.refMu.Unlock()
+	}
+}
+
+// StatusInfo represents the current status of the scheduler
+type StatusInfo struct {
+	RunningRequests []RequestInfo `json:"running_requests"`
+	PendingRequests []string      `json:"pending_requests"`
+	FreeMemory      uint64        `json:"free_memory"`
+}
+
+// RequestInfo represents information about a running request
+type RequestInfo struct {
+	ID              string `json:"id"`
+	GeneratedTokens int    `json:"generated_tokens"`
+}
+
+// GetStatus returns the current status of the scheduler
+func (s *Scheduler) GetStatus() StatusInfo {
+	s.requestMu.RLock()
+	defer s.requestMu.RUnlock()
+
+	// Get running requests
+	runningReqs := make([]RequestInfo, 0, len(s.runningRequests))
+	for id, req := range s.runningRequests {
+		runningReqs = append(runningReqs, RequestInfo{
+			ID:              id,
+			GeneratedTokens: req.generatedTokens,
+		})
+	}
+
+	// Copy pending requests
+	pendingReqs := make([]string, len(s.pendingRequests))
+	copy(pendingReqs, s.pendingRequests)
+
+	// Calculate free memory from GPUs, adjusted for currently loaded runners
+	var freeMemory uint64
+	systemInfo := s.getSystemInfoFn
+	freeMemory = systemInfo().FreeMemory
+
+	return StatusInfo{
+		RunningRequests: runningReqs,
+		PendingRequests: pendingReqs,
+		FreeMemory:      freeMemory,
+	}
+}
+
+// UpdateRequestTokens updates the generated token count for a running request
+func (s *Scheduler) UpdateRequestTokens(requestID string, tokens int) {
+	s.requestMu.Lock()
+	defer s.requestMu.Unlock()
+
+	if req, ok := s.runningRequests[requestID]; ok {
+		req.generatedTokens = tokens
 	}
 }

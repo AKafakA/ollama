@@ -125,6 +125,8 @@ type GenerateRequest struct {
 	// each with an associated log probability. Only applies when Logprobs is true.
 	// Valid values are 0-20. Default is 0 (only return the selected token's logprob).
 	TopLogprobs int `json:"top_logprobs,omitempty"`
+
+	ID string `json:"id,omitempty"` // optional ID to track the request
 }
 
 // ChatRequest describes a request sent by [Client.Chat].
@@ -678,6 +680,19 @@ type ProcessModelResponse struct {
 	ContextLength int          `json:"context_length"`
 }
 
+// StatusResponse is the response from the /api/status endpoint.
+type StatusResponse struct {
+	RunningRequests []RequestStatus `json:"running_requests"`
+	PendingRequests []string        `json:"pending_requests"`
+	FreeMemory      uint64          `json:"free_memory"`
+}
+
+// RequestStatus represents information about a running request.
+type RequestStatus struct {
+	ID              string `json:"id"`
+	GeneratedTokens int    `json:"generated_tokens"`
+}
+
 type TokenResponse struct {
 	Token string `json:"token"`
 }
@@ -722,6 +737,8 @@ type GenerateResponse struct {
 	// Logprobs contains log probability information for the generated tokens,
 	// if requested via the Logprobs parameter.
 	Logprobs []Logprob `json:"logprobs,omitempty"`
+
+	ID string `json:"id,omitempty"` // optional ID to track the request
 }
 
 // ModelDetails provides details about a model.

@@ -1594,8 +1594,9 @@ func (s *llmServer) Completion(ctx context.Context, req CompletionRequest, fn fu
 
 			if c.Content != "" {
 				fn(CompletionResponse{
-					Content:  c.Content,
-					Logprobs: c.Logprobs,
+					Content:   c.Content,
+					EvalCount: c.EvalCount,
+					Logprobs:  c.Logprobs,
 				})
 			}
 
